@@ -1,0 +1,103 @@
+from typing import Dict, List
+
+import pandas as pd
+
+from src.config import Config
+from src.data_loader import fetch_market_data
+from src.dataset import LNNBenchmarkModel, NNARModel, VARModelWrapper, combine_forecasts, evaluate_predictions
+from src.feature_engineering import clean_market_data, engineer_features
+from src.dataset import split_time_series
+from src.dataset import create_multihorizon_dataset
+
+
+def build_model_forecasts(train_df: pd.DataFrame, test_df: pd.DataFrame, target_col: str = "Close"):
+    X_train = train_df.drop(columns=["date", "symbol", "target", "horizon"], errors="ignore")
+    y_train = train_df["target"]
+    X_test = test_df.drop(columns=["date", "symbol", "target", "horizon"], errors="ignore")
+    y_test = test_df["target"]
+
+    # LNN benchmark
+    lnn = LNNBenchmarkModel()
+    lnn.fit(X_train, y_train)
+    pred_lnn = lnn.predict(X_test)
+
+    # NNAR forecast
+    nnar = NNARModel(hidden_layer_sizes=(64, 32), random_state=42)
+    nnar.fit(X_train, y_train)
+    pred_nnar = nnar.predict(X_test)
+
+    # VAR forecast on lag-based and rolling features
+    var_cols = [c for c in X_train.columns if ("lag" in c.lower() or "rolling" in c.lower())]
+    if len(var_cols) >= 2:
+        var_df = pd.concat([
+            y_train.reset_index(drop=True),
+            X_train[var_cols].reset_index(drop=True)
+        ], axis=1)
+        var_model = VARModelWrapper(p=3)
+        var_model.fit(var_df)
+        pred_var = var_model.predict(pd.concat([
+            y_train.reset_index(drop=True),
+            X_train[var_cols].reset_index(drop=True)
+        ], axis=1), steps=len(X_test))
+    else:
+        pred_var = pred_lnn.copy()
+
+    forecast_map = {
+        "LNN": pred_lnn,
+        "NNAR": pred_nnar,
+        "VAR": pred_var,
+    }
+
+    metrics = {
+        "LNN": evaluate_predictions(y_test, pred_lnn),
+        "NNAR": evaluate_predictions(y_test, pred_nnar),
+        "VAR": evaluate_predictions(y_test, pred_var),
+    }
+
+    hybrid = combine_forecasts(forecast_map, metrics)
+    metrics["HYBRID"] = evaluate_predictions(y_test, hybrid)
+
+    return {
+        "metrics": metrics,
+        "predictions": forecast_map,
+        "hybrid": hybrid,
+        "target": y_test,
+    }
+
+
+def run_pipeline_for_symbol(symbol: str, config: Config):
+    data_map = fetch_market_data([symbol], config.start_date, config.end_date)
+    raw_df = data_map[symbol]
+    cleaned = clean_market_data(raw_df)
+    engineered = engineer_features(cleaned, target_col=config.target_col)
+
+    # Create a multihorizon dataset
+    dataset, feature_cols = create_multihorizon_dataset(
+        engineered,
+        horizons=config.horizons,
+        lookback=config.lookback,
+        target_col=config.target_col,
+    )
+
+    results: Dict[int, Dict] = {}
+    for horizon in config.horizons:
+        horizon_df = dataset[dataset["horizon"] == horizon].copy().dropna().reset_index(drop=True)
+        train_df, val_df, test_df = split_time_series(horizon_df, config.train_ratio, config.validation_ratio, config.test_ratio)
+
+        if len(test_df) < 5:
+            continue
+
+        model_out = build_model_forecasts(train_df, test_df, target_col=config.target_col)
+        results[horizon] = model_out
+
+    return {
+        "symbol": symbol,
+        "results": results,
+    }
+
+
+def run_pipeline(config: Config):
+    output = {}
+    for symbol in config.symbols:
+        output[symbol] = run_pipeline_for_symbol(symbol, config)
+    return output
